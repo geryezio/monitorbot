@@ -206,7 +206,7 @@ async def send_uptime(message, context):
 
 
 def _updates_text(title, updated, up_to_date, errors, base_updated, base_ok, base_not_local, base_errors):
-    """Susun pesan /updates: image container + base image dari Dockerfile."""
+    """Build the /updates message: container images + Dockerfile base images."""
     lines = [title]
 
     if updated:
@@ -224,9 +224,9 @@ def _updates_text(title, updated, up_to_date, errors, base_updated, base_ok, bas
             lines.append(f"• `{b['image']}` — {projects}")
         lines.append("_(Run `docker compose build --pull && docker compose up -d` in those project folders)_")
     elif base_ok:
-        # base_not_local = base image yang tidak tersimpan di lokal (umumnya karena
-        # BuildKit cuma memakainya saat build, bukan sebagai image bertag).
-        # Jangan diklaim "all up to date" kalau masih ada yang belum dicek.
+        # base_not_local = base images not stored locally (usually because BuildKit
+        # only uses them during a build, not as tagged images).
+        # Don't claim "all up to date" while some of them were not checked.
         label = "no updates detected" if base_not_local else "all up to date"
         lines.append(f"\n🧱 *Dockerfile base images:* {label}")
 
@@ -433,10 +433,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Error handler ───────────────────────────────
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Kabari ke Telegram kalau ada handler yang gagal, biar tidak senyap di log.
+    """Report failing handlers to Telegram so they don't fail silently in the log.
 
-    Sengaja tanpa parse_mode: pesan error Docker mentah bisa mengandung karakter
-    Markdown (garis bawah/backtick) yang bikin pengiriman ikut gagal.
+    Deliberately without parse_mode: raw Docker error messages can contain
+    Markdown characters (underscores/backticks) that would break the delivery.
     """
     err = context.error
     print(f"❌ Error: {err}")
@@ -450,7 +450,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         elif ADMIN_CHAT_ID:
             await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
     except Exception as e:
-        print(f"❌ Gagal kirim error ke Telegram: {e}")
+        print(f"❌ Failed to send error to Telegram: {e}")
 
 
 # ── Main ────────────────────────────────────────

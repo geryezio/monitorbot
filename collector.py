@@ -209,9 +209,9 @@ def docker_containers() -> list[dict]:
         else:
             short = f"🟡 {status}"
 
-        # Image bisa saja sudah dihapus (prune/rmi) walau containernya masih terdaftar,
-        # dan c.image.tags melempar ImageNotFound kalau itu terjadi — bikin seluruh daftar
-        # container gagal. Ambil nama image dari metadata container sebagai cadangan.
+        # The image may have been removed (prune/rmi) while the container is still
+        # listed; c.image.tags raises ImageNotFound in that case and would break the
+        # whole container list. Fall back to the image name from container metadata.
         try:
             image_tags = c.image.tags
             image = image_tags[0] if image_tags else c.image.short_id
@@ -381,7 +381,7 @@ def docker_group_has_dockerfile(group: str) -> bool:
 # ── IMAGE UPDATES ────────────────────────────────
 
 def _registry_parts(image_name: str) -> tuple[str, str, str]:
-    """Pecah nama image jadi (registry, repo, tag)."""
+    """Split an image name into (registry, repo, tag)."""
     registry = "registry-1.docker.io"
     repo = image_name
     tag = "latest"
@@ -404,7 +404,7 @@ def _registry_parts(image_name: str) -> tuple[str, str, str]:
 
 
 def _registry_token(registry: str, repo: str) -> str:
-    """Bearer token untuk pull image publik (Docker Hub / GHCR)."""
+    """Bearer token for pulling public images (Docker Hub / GHCR)."""
     import json
     import urllib.request
 
@@ -425,7 +425,7 @@ def _registry_token(registry: str, repo: str) -> str:
 
 
 def _get_remote_digest(image_name: str) -> str:
-    """Digest manifest image di registry (Docker Hub / GHCR), "" kalau tidak ada."""
+    """Manifest digest of an image in the registry (Docker Hub / GHCR); "" if unavailable."""
     import urllib.request
 
     registry, repo, tag = _registry_parts(image_name)
@@ -447,10 +447,10 @@ def _get_remote_digest(image_name: str) -> str:
 
 
 def _get_remote_created(image_name: str, arch: str = "amd64", os_name: str = "linux") -> str:
-    """Waktu build config image remote untuk platform tertentu ("" kalau gagal).
+    """Build time of the remote image config for a given platform ("" on failure).
 
-    Dipakai untuk base image: digest index bisa berubah karena re-attestation
-    walau isinya sama, jadi yang dibandingkan adalah timestamp config-nya.
+    Used for base images: index digests can change because of re-attestation
+    even when the content is identical, so we compare the config timestamps.
     """
     import json
     import urllib.request
@@ -515,8 +515,8 @@ def check_image_updates() -> tuple[list[str], list[str], list[str]]:
         try:
             tags = c.image.tags
         except Exception:
-            # Image bisa sudah dihapus (prune/rmi) — nama aslinya masih tersimpan
-            # di metadata container, pakai itu supaya satu container tidak bikin gagal semua.
+            # The image may have been removed (prune/rmi) — its original name is still
+            # stored in the container metadata; use it so one container can't break all.
             fallback = c.attrs.get("Config", {}).get("Image")
             tags = [fallback] if fallback else []
         if tags:
@@ -537,7 +537,7 @@ def check_image_updates() -> tuple[list[str], list[str], list[str]]:
             remote_digest = _get_remote_digest(tag)
             
             if not remote_digest:
-                # Abaikan image lokal atau gagal cek ke registry agar tidak memenuhi pesan UI
+                # Skip local images or failed registry checks so they don't clutter the UI
                 continue
                 
             is_updated = True
@@ -564,7 +564,7 @@ ARG_RE = re.compile(r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(\S+))?\s*$")
 
 
 def _parse_timestamp(value: str):
-    """Parse ISO8601 (dengan 'Z') jadi datetime aware; None kalau gagal."""
+    """Parse ISO8601 (with 'Z') into an aware datetime; None on failure."""
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
@@ -572,14 +572,14 @@ def _parse_timestamp(value: str):
 
 
 def _dockerfile_path(workdir: str) -> str:
-    """Path Dockerfile compose project di host (dibaca lewat /host_root)."""
+    """Host path of a compose project's Dockerfile (read via /host_root)."""
     base = f"{HOST_ROOT}{workdir}" if os.path.isdir(HOST_ROOT) else workdir
     path = os.path.join(base, "Dockerfile")
     return path if os.path.isfile(path) else ""
 
 
 def _parse_base_images(path: str) -> list[str]:
-    """Ambil base image dari baris FROM, resolve ARG sederhana, skip stage alias."""
+    """Extract base images from FROM lines, resolving simple ARGs and skipping stage aliases."""
     try:
         with open(path) as f:
             lines = f.readlines()
@@ -621,7 +621,7 @@ def _parse_base_images(path: str) -> list[str]:
 
 
 def _base_image_projects() -> dict[str, list[str]]:
-    """Map base image -> daftar project compose yang memakainya."""
+    """Map base image -> list of compose projects that use it."""
     client = _get_docker()
     if client is None:
         return {}
@@ -650,12 +650,12 @@ def _base_image_projects() -> dict[str, list[str]]:
 
 
 def check_base_image_updates() -> tuple[list[dict], list[str], list[str], list[str]]:
-    """Cek base image (FROM) tiap Dockerfile: digest lokal vs registry.
+    """Check the base image (FROM) of every Dockerfile: local vs registry.
 
-    Return (updated, up_to_date, not_local, errors). Item `updated` berbentuk
-    {"image": str, "projects": list[str]} supaya bot bisa tampilkan
-    project mana yang perlu di-rebuild. `not_local` = base image yang belum
-    ada di lokal (tidak bisa dibandingkan, akan di-pull saat build).
+    Returns (updated, up_to_date, not_local, errors). Items in `updated` are
+    {"image": str, "projects": list[str]} so the bot can show which projects
+    need a rebuild. `not_local` = base images missing locally (cannot be
+    compared; they get pulled on the next build).
     """
     client = _get_docker()
     if client is None:
@@ -669,13 +669,13 @@ def check_base_image_updates() -> tuple[list[dict], list[str], list[str], list[s
         try:
             local = client.images.get(tag)
         except Exception:
-            # Belum ada di lokal — build berikutnya akan pull versi terbaru.
+            # Not available locally — the next build will pull the latest version.
             not_local.append(tag)
             continue
 
         remote_created = _get_remote_created(tag)
         if not remote_created:
-            # Registry tidak dikenal / gagal cek — abaikan supaya UI tidak berisik.
+            # Unknown registry / failed check — skip silently to keep the UI clean.
             continue
 
         local_dt = _parse_timestamp(local.attrs.get("Created", ""))

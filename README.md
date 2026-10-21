@@ -35,7 +35,7 @@ No terminal or SSH needed. Just open Telegram, type `/status`, and all your serv
 
 | Component | Technology | Role |
 | --- | --- | --- |
-| **Runtime** | Python 3.14 | Bot logic and data collection |
+| **Runtime** | Python 3.15 | Bot logic and data collection |
 | **Bot Framework** | `python-telegram-bot` v20+ | Command handling, callback queries, and job queue |
 | **System Metrics** | `psutil` 5.9+ | Reading CPU, RAM, disk, network, and processes from host `/proc` |
 | **Docker SDK** | `docker` 7.0+ | Container management (list, start, stop, restart) via Docker socket |
