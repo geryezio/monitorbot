@@ -3,6 +3,7 @@ Server data collector — CPU, RAM, disk, Docker, network info.
 """
 
 import os
+import re
 import shutil
 from datetime import datetime, timedelta
 
@@ -208,8 +209,14 @@ def docker_containers() -> list[dict]:
         else:
             short = f"🟡 {status}"
 
-        image_tags = c.image.tags
-        image = image_tags[0] if image_tags else c.image.short_id
+        # Image bisa saja sudah dihapus (prune/rmi) walau containernya masih terdaftar,
+        # dan c.image.tags melempar ImageNotFound kalau itu terjadi — bikin seluruh daftar
+        # container gagal. Ambil nama image dari metadata container sebagai cadangan.
+        try:
+            image_tags = c.image.tags
+            image = image_tags[0] if image_tags else c.image.short_id
+        except Exception:
+            image = c.attrs.get("Config", {}).get("Image") or c.attrs.get("Image", "")[:19]
 
         # Detect compose project from label
         project = c.labels.get("com.docker.compose.project", "")
@@ -373,57 +380,126 @@ def docker_group_has_dockerfile(group: str) -> bool:
 
 # ── IMAGE UPDATES ────────────────────────────────
 
-def check_image_updates() -> tuple[list[str], list[str], list[str]]:
+def _registry_parts(image_name: str) -> tuple[str, str, str]:
+    """Pecah nama image jadi (registry, repo, tag)."""
+    registry = "registry-1.docker.io"
+    repo = image_name
+    tag = "latest"
+
+    if ":" in image_name:
+        repo, tag = image_name.rsplit(":", 1)
+
+    if "/" not in repo:
+        repo = f"library/{repo}"
+
+    parts = repo.split("/", 1)
+    if "." in parts[0] and parts[0] != "docker.io":
+        registry = parts[0]
+        repo = parts[1]
+    elif parts[0] == "docker.io":
+        registry = "registry-1.docker.io"
+        repo = parts[1]
+
+    return registry, repo, tag
+
+
+def _registry_token(registry: str, repo: str) -> str:
+    """Bearer token untuk pull image publik (Docker Hub / GHCR)."""
     import json
     import urllib.request
 
-    def get_remote_digest(image_name: str) -> str:
-        registry = "registry-1.docker.io"
-        repo = image_name
-        tag = "latest"
-        
-        if ":" in image_name:
-            repo, tag = image_name.rsplit(":", 1)
-            
-        if "/" not in repo:
-            repo = f"library/{repo}"
-            
-        parts = repo.split("/", 1)
-        if "." in parts[0] and parts[0] != "docker.io":
-            registry = parts[0]
-            repo = parts[1]
-        elif parts[0] == "docker.io":
-            registry = "registry-1.docker.io"
-            repo = parts[1]
-            
-        token = ""
-        try:
-            if registry == "registry-1.docker.io":
-                auth_url = f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"
-                req = urllib.request.Request(auth_url)
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    token = json.loads(response.read().decode()).get("token", "")
-            elif registry == "ghcr.io":
-                auth_url = f"https://ghcr.io/token?service=ghcr.io&scope=repository:{repo}:pull"
-                req = urllib.request.Request(auth_url)
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    token = json.loads(response.read().decode()).get("token", "")
-        except Exception:
-            pass
-            
-        manifest_url = f"https://{registry}/v2/{repo}/manifests/{tag}"
-        req = urllib.request.Request(manifest_url)
-        req.add_header("Accept", "application/vnd.docker.distribution.manifest.v2+json")
-        req.add_header("Accept", "application/vnd.docker.distribution.manifest.list.v2+json")
-        req.add_header("Accept", "application/vnd.oci.image.index.v1+json")
+    token = ""
+    try:
+        if registry == "registry-1.docker.io":
+            auth_url = f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"
+            with urllib.request.urlopen(urllib.request.Request(auth_url), timeout=10) as response:
+                token = json.loads(response.read().decode()).get("token", "")
+        elif registry == "ghcr.io":
+            auth_url = f"https://ghcr.io/token?service=ghcr.io&scope=repository:{repo}:pull"
+            with urllib.request.urlopen(urllib.request.Request(auth_url), timeout=10) as response:
+                token = json.loads(response.read().decode()).get("token", "")
+    except Exception:
+        pass
+
+    return token
+
+
+def _get_remote_digest(image_name: str) -> str:
+    """Digest manifest image di registry (Docker Hub / GHCR), "" kalau tidak ada."""
+    import urllib.request
+
+    registry, repo, tag = _registry_parts(image_name)
+    token = _registry_token(registry, repo)
+
+    manifest_url = f"https://{registry}/v2/{repo}/manifests/{tag}"
+    req = urllib.request.Request(manifest_url)
+    req.add_header("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+    req.add_header("Accept", "application/vnd.docker.distribution.manifest.list.v2+json")
+    req.add_header("Accept", "application/vnd.oci.image.index.v1+json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.headers.get("Docker-Content-Digest", "")
+    except Exception:
+        return ""
+
+
+def _get_remote_created(image_name: str, arch: str = "amd64", os_name: str = "linux") -> str:
+    """Waktu build config image remote untuk platform tertentu ("" kalau gagal).
+
+    Dipakai untuk base image: digest index bisa berubah karena re-attestation
+    walau isinya sama, jadi yang dibandingkan adalah timestamp config-nya.
+    """
+    import json
+    import urllib.request
+
+    registry, repo, tag = _registry_parts(image_name)
+    token = _registry_token(registry, repo)
+    base = f"https://{registry}/v2/{repo}"
+
+    def fetch(url: str, accept: str) -> dict:
+        req = urllib.request.Request(url)
+        req.add_header("Accept", accept)
         if token:
             req.add_header("Authorization", f"Bearer {token}")
-            
-        try:
-            with urllib.request.urlopen(req, timeout=10) as response:
-                return response.headers.get("Docker-Content-Digest", "")
-        except Exception:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode())
+
+    try:
+        index = fetch(
+            f"{base}/manifests/{tag}",
+            "application/vnd.oci.image.index.v1+json,"
+            "application/vnd.docker.distribution.manifest.list.v2+json,"
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
+
+        manifest = index
+        for entry in index.get("manifests", []):
+            platform = entry.get("platform", {})
+            if platform.get("architecture") == arch and platform.get("os") == os_name:
+                manifest = fetch(
+                    f"{base}/manifests/{entry['digest']}",
+                    "application/vnd.docker.distribution.manifest.v2+json,"
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
+                break
+
+        config_digest = manifest.get("config", {}).get("digest", "")
+        if not config_digest:
             return ""
+
+        req = urllib.request.Request(f"{base}/blobs/{config_digest}")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode()).get("created", "")
+    except Exception:
+        return ""
+
+
+def check_image_updates() -> tuple[list[str], list[str], list[str]]:
 
     client = _get_docker()
     if client is None:
@@ -436,7 +512,13 @@ def check_image_updates() -> tuple[list[str], list[str], list[str]]:
         
     image_tags = set()
     for c in containers:
-        tags = c.image.tags
+        try:
+            tags = c.image.tags
+        except Exception:
+            # Image bisa sudah dihapus (prune/rmi) — nama aslinya masih tersimpan
+            # di metadata container, pakai itu supaya satu container tidak bikin gagal semua.
+            fallback = c.attrs.get("Config", {}).get("Image")
+            tags = [fallback] if fallback else []
         if tags:
             image_tags.add(tags[0])
             
@@ -452,7 +534,7 @@ def check_image_updates() -> tuple[list[str], list[str], list[str]]:
             except Exception:
                 continue
                 
-            remote_digest = get_remote_digest(tag)
+            remote_digest = _get_remote_digest(tag)
             
             if not remote_digest:
                 # Abaikan image lokal atau gagal cek ke registry agar tidak memenuhi pesan UI
@@ -473,6 +555,140 @@ def check_image_updates() -> tuple[list[str], list[str], list[str]]:
             pass
             
     return (updated, up_to_date, errors)
+
+
+# ── BASE IMAGE UPDATES (FROM Dockerfile) ─────────
+
+FROM_RE = re.compile(r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+[Aa][Ss]\s+(\S+))?\s*$")
+ARG_RE = re.compile(r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(\S+))?\s*$")
+
+
+def _parse_timestamp(value: str):
+    """Parse ISO8601 (dengan 'Z') jadi datetime aware; None kalau gagal."""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _dockerfile_path(workdir: str) -> str:
+    """Path Dockerfile compose project di host (dibaca lewat /host_root)."""
+    base = f"{HOST_ROOT}{workdir}" if os.path.isdir(HOST_ROOT) else workdir
+    path = os.path.join(base, "Dockerfile")
+    return path if os.path.isfile(path) else ""
+
+
+def _parse_base_images(path: str) -> list[str]:
+    """Ambil base image dari baris FROM, resolve ARG sederhana, skip stage alias."""
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+
+    args = {}
+    for line in lines:
+        m = ARG_RE.match(line)
+        if m and m.group(2):
+            args[m.group(1)] = m.group(2)
+
+    images = []
+    stages = set()
+
+    for line in lines:
+        m = FROM_RE.match(line)
+        if not m:
+            continue
+
+        image, alias = m.group(1), m.group(2)
+
+        def _resolve(mm):
+            name = mm.group(1) or mm.group(2)
+            return args.get(name, mm.group(0))
+
+        image = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", _resolve, image)
+
+        if alias:
+            stages.add(alias.lower())
+        if not image or image.lower() == "scratch" or "$" in image or "@sha256:" in image:
+            continue
+        if image.lower() in stages:
+            continue
+        if image not in images:
+            images.append(image)
+
+    return images
+
+
+def _base_image_projects() -> dict[str, list[str]]:
+    """Map base image -> daftar project compose yang memakainya."""
+    client = _get_docker()
+    if client is None:
+        return {}
+
+    projects = {}
+    try:
+        for c in client.containers.list(all=True):
+            project = c.labels.get("com.docker.compose.project", "")
+            workdir = c.labels.get("com.docker.compose.project.working_dir", "")
+            if project and workdir and project not in projects:
+                projects[project] = workdir
+    except Exception:
+        return {}
+
+    uses = {}
+    for project, workdir in projects.items():
+        path = _dockerfile_path(workdir)
+        if not path:
+            continue
+        for image in _parse_base_images(path):
+            uses.setdefault(image, [])
+            if project not in uses[image]:
+                uses[image].append(project)
+
+    return uses
+
+
+def check_base_image_updates() -> tuple[list[dict], list[str], list[str], list[str]]:
+    """Cek base image (FROM) tiap Dockerfile: digest lokal vs registry.
+
+    Return (updated, up_to_date, not_local, errors). Item `updated` berbentuk
+    {"image": str, "projects": list[str]} supaya bot bisa tampilkan
+    project mana yang perlu di-rebuild. `not_local` = base image yang belum
+    ada di lokal (tidak bisa dibandingkan, akan di-pull saat build).
+    """
+    client = _get_docker()
+    if client is None:
+        return ([], [], [], ["Docker not accessible"])
+
+    updated, up_to_date, not_local, errors = [], [], [], []
+
+    for image, projects in sorted(_base_image_projects().items()):
+        tag = image if ":" in image else f"{image}:latest"
+
+        try:
+            local = client.images.get(tag)
+        except Exception:
+            # Belum ada di lokal — build berikutnya akan pull versi terbaru.
+            not_local.append(tag)
+            continue
+
+        remote_created = _get_remote_created(tag)
+        if not remote_created:
+            # Registry tidak dikenal / gagal cek — abaikan supaya UI tidak berisik.
+            continue
+
+        local_dt = _parse_timestamp(local.attrs.get("Created", ""))
+        remote_dt = _parse_timestamp(remote_created)
+        if not local_dt or not remote_dt:
+            continue
+
+        if remote_dt > local_dt:
+            updated.append({"image": tag, "projects": projects})
+        else:
+            up_to_date.append(tag)
+
+    return (updated, up_to_date, not_local, errors)
 
 
 # ── TOP PROCESSES ────────────────────────────────

@@ -25,7 +25,7 @@ No terminal or SSH needed. Just open Telegram, type `/status`, and all your serv
 - 🌐 **`/net`** — Local IP addresses per interface & Tailscale address
 - 📊 **`/top`** — Top 5 processes by CPU and RAM usage
 - ⏱️ **`/uptime`** — Time since the last server reboot
-- 🔄 **`/updates`** — Check Docker image updates (registry vs local digest); automatic periodic notifications
+- 🔄 **`/updates`** — Check Docker image updates (registry vs local digest) **plus base images from each project's Dockerfile** (`FROM php:8.5-fpm`, `node:24`, dst); automatic periodic notifications
 - 🔘 **Inline Keyboard** — Quick navigation without retyping commands
 - 📝 **Auto-register Commands** — All commands appear in the Telegram bot menu with no BotFather setup
 

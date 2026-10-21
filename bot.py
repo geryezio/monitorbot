@@ -38,6 +38,7 @@ from collector import (
     top_processes,
     uptime_info,
     check_image_updates,
+    check_base_image_updates,
 )
 
 load_dotenv()
@@ -204,45 +205,66 @@ async def send_uptime(message, context):
     )
 
 
-async def send_updates(message, context):
-    msg = await message.reply_text("⏳ *Checking for image updates...*\n_(Checking version only, no images will be downloaded)_", parse_mode=ParseMode.MARKDOWN)
-    
-    updated, up_to_date, errors = await asyncio.to_thread(check_image_updates)
-    
-    lines = ["🔄 *Image Update Check Results*\n"]
-    
+def _updates_text(title, updated, up_to_date, errors, base_updated, base_ok, base_not_local, base_errors):
+    """Susun pesan /updates: image container + base image dari Dockerfile."""
+    lines = [title]
+
     if updated:
-        lines.append("✅ *Updates Available (Not Downloaded):*")
+        lines.append("✅ *Container images — updates available:*")
         for u in updated:
             lines.append(f"• `{u}`")
-        lines.append("\n_(Please run `docker compose pull` and `docker compose up -d` manually in your server terminal to update)_\n")
+        lines.append("_(Run `docker compose pull && docker compose up -d` in the project folder)_")
     else:
-        lines.append("✅ *All images are up to date!*")
-        
-    await msg.edit_text("\n".join(lines), reply_markup=back_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        lines.append("✅ *Container images:* all up to date")
+
+    if base_updated:
+        lines.append("\n🧱 *Dockerfile base images — updates available:*")
+        for b in base_updated:
+            projects = ", ".join(f"`{p}`" for p in b["projects"])
+            lines.append(f"• `{b['image']}` — {projects}")
+        lines.append("_(Run `docker compose build --pull && docker compose up -d` in those project folders)_")
+    elif base_ok:
+        # base_not_local = base image yang tidak tersimpan di lokal (umumnya karena
+        # BuildKit cuma memakainya saat build, bukan sebagai image bertag).
+        # Jangan diklaim "all up to date" kalau masih ada yang belum dicek.
+        label = "no updates detected" if base_not_local else "all up to date"
+        lines.append(f"\n🧱 *Dockerfile base images:* {label}")
+
+    if errors or base_errors:
+        lines.append(f"\n⚠️ Errors: {', '.join(errors + base_errors)}")
+
+    return "\n".join(lines)
+
+
+async def send_updates(message, context):
+    msg = await message.reply_text("⏳ *Checking for image updates...*\n_(Checking version only, no images will be downloaded)_", parse_mode=ParseMode.MARKDOWN)
+
+    updated, up_to_date, errors = await asyncio.to_thread(check_image_updates)
+    base_updated, base_ok, base_not_local, base_errors = await asyncio.to_thread(check_base_image_updates)
+
+    text = _updates_text(
+        "🔄 *Image Update Check Results*\n",
+        updated, up_to_date, errors,
+        base_updated, base_ok, base_not_local, base_errors,
+    )
+
+    await msg.edit_text(text, reply_markup=back_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
 
 async def background_update_check(context: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_CHAT_ID:
         print("⚠️ ADMIN_CHAT_ID not set, skipping update check")
         return
-        
+
     updated, up_to_date, errors = await asyncio.to_thread(check_image_updates)
-    
-    lines = ["🔔 *Automatic Update Alert* 🔔\n"]
-    if updated:
-        lines.append("✅ *Updates Available (Not Downloaded):*")
-        for u in updated:
-            lines.append(f"• `{u}`")
-        lines.append("\n_(Please run `docker compose pull` and `docker compose up -d` manually in your server terminal to update)_")
-    else:
-        lines.append("✅ *All images are up to date!*")
-    
-    if errors:
-        lines.append(f"\n⚠️ Errors: {', '.join(errors)}")
-    
-    text = "\n".join(lines)
-    
+    base_updated, base_ok, base_not_local, base_errors = await asyncio.to_thread(check_base_image_updates)
+
+    text = _updates_text(
+        "🔔 *Automatic Update Alert* 🔔\n",
+        updated, up_to_date, errors,
+        base_updated, base_ok, base_not_local, base_errors,
+    )
+
     try:
         await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN)
         print(f"📤 Update check sent to {ADMIN_CHAT_ID}")
@@ -408,6 +430,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+# ── Error handler ───────────────────────────────
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Kabari ke Telegram kalau ada handler yang gagal, biar tidak senyap di log.
+
+    Sengaja tanpa parse_mode: pesan error Docker mentah bisa mengandung karakter
+    Markdown (garis bawah/backtick) yang bikin pengiriman ikut gagal.
+    """
+    err = context.error
+    print(f"❌ Error: {err}")
+
+    text = f"❌ MonitorBot error\n\n{type(err).__name__}: {err}"
+
+    try:
+        chat = getattr(update, "effective_chat", None)
+        if chat is not None:
+            await chat.send_message(text)
+        elif ADMIN_CHAT_ID:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+    except Exception as e:
+        print(f"❌ Gagal kirim error ke Telegram: {e}")
+
+
 # ── Main ────────────────────────────────────────
 
 def main():
@@ -422,6 +467,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(start_nav_handler, pattern=r"^qcmd:"))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_error_handler(on_error)
 
     # Schedule background update check
     app.job_queue.run_repeating(background_update_check, interval=UPDATE_INTERVAL, first=10)
