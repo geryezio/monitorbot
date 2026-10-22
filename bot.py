@@ -12,12 +12,15 @@ Setup:
 
 import asyncio
 import os
+import time
 from datetime import datetime
 
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
 
 from collector import (
     cpu_percent,
@@ -48,6 +51,41 @@ if not BOT_TOKEN:
 
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL_SECONDS", 86400))
+
+# Throttles the "Telegram connection lost" notice (monotonic seconds).
+_last_network_notice = 0.0
+
+
+# ── Telegram request layer ──────────────────────
+
+class RetryingHTTPXRequest(HTTPXRequest):
+    """Retry requests that failed BEFORE reaching Telegram.
+
+    The home link (IndiHome) sometimes drops the TLS handshake to
+    api.telegram.org (anyio BrokenResourceError -> httpx.ConnectError with an
+    empty message, roughly 1 in 20 new connections). Nothing has been delivered
+    at that point, so a retry is safe. ReadError/ReadTimeout are NOT retried:
+    the request may already have been processed (e.g. send_message) and a retry
+    would duplicate it.
+    """
+
+    ATTEMPTS = 4
+    CONNECT_ERRORS = ("httpx.ConnectError", "httpx.ConnectTimeout")
+
+    async def do_request(self, *args, **kwargs):
+        delay = 1.0
+        for attempt in range(1, self.ATTEMPTS + 1):
+            try:
+                return await super().do_request(*args, **kwargs)
+            except (NetworkError, TimedOut) as exc:
+                transient = any(tag in str(exc) for tag in self.CONNECT_ERRORS)
+                if not transient or attempt == self.ATTEMPTS:
+                    raise
+                print(f"↻ Telegram connect failed, retry {attempt}/{self.ATTEMPTS - 1} in {delay:.0f}s ({exc})")
+                await asyncio.sleep(delay)
+                delay *= 2
+        raise RuntimeError("unreachable")  # the loop always returns or raises
+
 
 # ── Formatting helpers ──────────────────────────
 
@@ -221,14 +259,19 @@ def _updates_text(title, updated, up_to_date, errors, base_updated, base_ok, bas
         lines.append("\n🧱 *Dockerfile base images — updates available:*")
         for b in base_updated:
             projects = ", ".join(f"`{p}`" for p in b["projects"])
-            lines.append(f"• `{b['image']}` — {projects}")
+            hint = " _(estimated from upstream publish date)_" if b.get("approx") else ""
+            lines.append(f"• `{b['image']}` — {projects}{hint}")
         lines.append("_(Run `docker compose build --pull && docker compose up -d` in those project folders)_")
     elif base_ok:
-        # base_not_local = base images not stored locally (usually because BuildKit
-        # only uses them during a build, not as tagged images).
-        # Don't claim "all up to date" while some of them were not checked.
+        # base_not_local = base images we could not check (no local copy and no
+        # build time). Don't claim "all up to date" while some were skipped.
         label = "no updates detected" if base_not_local else "all up to date"
         lines.append(f"\n🧱 *Dockerfile base images:* {label}")
+    elif base_not_local:
+        lines.append(
+            f"\n🧱 *Dockerfile base images:* {len(base_not_local)} could not be checked "
+            "_(no local copy and no build time to compare)_"
+        )
 
     if errors or base_errors:
         lines.append(f"\n⚠️ Errors: {', '.join(errors + base_errors)}")
@@ -441,7 +484,22 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     print(f"❌ Error: {err}")
 
-    text = f"❌ MonitorBot error\n\n{type(err).__name__}: {err}"
+    global _last_network_notice
+
+    if isinstance(err, NetworkError):
+        # RetryingHTTPXRequest already tried 4 times; still failing means the
+        # link to Telegram is really down. Notify at most once per 5 minutes and
+        # keep the technical detail out of the chat.
+        if time.monotonic() - _last_network_notice < 300:
+            return
+        _last_network_notice = time.monotonic()
+        text = (
+            "⚠️ *Telegram connection lost*\n\n"
+            "The command was not delivered, but this is not a Docker/monitoring "
+            "error. Please press the button once more."
+        )
+    else:
+        text = f"❌ MonitorBot error\n\n{type(err).__name__}: {err}"
 
     try:
         chat = getattr(update, "effective_chat", None)
@@ -456,7 +514,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ────────────────────────────────────────
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).request(RetryingHTTPXRequest()).build()
 
     # Auto-register commands with Telegram (no BotFather needed)
     async def _setup(app):

@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 import psutil
 
@@ -509,7 +510,7 @@ def check_image_updates() -> tuple[list[str], list[str], list[str]]:
         containers = client.containers.list(all=True)
     except Exception as e:
         return ([], [], [str(e)])
-        
+
     image_tags = set()
     for c in containers:
         try:
@@ -521,40 +522,36 @@ def check_image_updates() -> tuple[list[str], list[str], list[str]]:
             tags = [fallback] if fallback else []
         if tags:
             image_tags.add(tags[0])
-            
+
+    # Local digests are cheap (docker socket), so read them sequentially first.
+    local_digests = {}
+    for tag in sorted(image_tags):
+        try:
+            img = client.images.get(tag)
+        except Exception:
+            continue
+        local_digests[tag] = img.attrs.get("RepoDigests", [])
+
+    # Registry lookups are the slow part (one HTTPS round-trip per image), so run
+    # them in parallel: 9 images used to take ~23s one by one.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        remote_digests = dict(pool.map(lambda t: (t, _get_remote_digest(t)), local_digests))
+
     updated = []
     up_to_date = []
-    errors = []
-    
-    for tag in image_tags:
-        try:
-            try:
-                img = client.images.get(tag)
-                local_repo_digests = img.attrs.get("RepoDigests", [])
-            except Exception:
-                continue
-                
-            remote_digest = _get_remote_digest(tag)
-            
-            if not remote_digest:
-                # Skip local images or failed registry checks so they don't clutter the UI
-                continue
-                
-            is_updated = True
-            for ld in local_repo_digests:
-                if remote_digest in ld:
-                    is_updated = False
-                    break
-                    
-            if is_updated:
-                updated.append(tag)
-            else:
-                up_to_date.append(tag)
-                
-        except Exception:
-            pass
-            
-    return (updated, up_to_date, errors)
+
+    for tag, local_digest_list in local_digests.items():
+        remote_digest = remote_digests.get(tag, "")
+        if not remote_digest:
+            # Skip local images or failed registry checks so they don't clutter the UI
+            continue
+
+        if any(remote_digest in ld for ld in local_digest_list):
+            up_to_date.append(tag)
+        else:
+            updated.append(tag)
+
+    return (sorted(updated), sorted(up_to_date), [])
 
 
 # ── BASE IMAGE UPDATES (FROM Dockerfile) ─────────
@@ -649,38 +646,106 @@ def _base_image_projects() -> dict[str, list[str]]:
     return uses
 
 
+def _project_build_times() -> dict[str, str]:
+    """Newest build time of a project's own image per compose project.
+
+    Base images (FROM ...) usually only live in the BuildKit cache, not as
+    tagged images, so there is no local digest to compare. The age of the
+    project's own image is the next best reference: a base image published
+    after that build is newer than whatever went into the image.
+
+    Compose names built images `<project>-<service>`, so images whose repo
+    starts with the project name win over pulled ones (phpmyadmin, mariadb,
+    nginx) that may happen to be newer. Docker 28 also records a RepoDigest for
+    locally built images, so RepoDigests cannot be used to tell them apart.
+    """
+    client = _get_docker()
+    if client is None:
+        return {}
+
+    own, any_image = {}, {}
+    try:
+        containers = client.containers.list(all=True)
+    except Exception:
+        return own
+
+    for c in containers:
+        project = c.labels.get("com.docker.compose.project", "")
+        if not project:
+            continue
+        try:
+            img = c.image
+            attrs = img.attrs if img is not None else None
+        except Exception:
+            continue
+        if not attrs:
+            continue
+
+        created = attrs.get("Created", "")
+        if not created:
+            continue
+
+        names = (attrs.get("RepoTags") or []) + [d.split("@")[0] for d in attrs.get("RepoDigests") or []]
+        is_own = any(n.split(":")[0].split("/")[-1].startswith(project) for n in names)
+
+        bucket = own if is_own else any_image
+        if created > bucket.get(project, ""):
+            bucket[project] = created
+
+    return {**any_image, **own}
+
+
 def check_base_image_updates() -> tuple[list[dict], list[str], list[str], list[str]]:
     """Check the base image (FROM) of every Dockerfile: local vs registry.
 
     Returns (updated, up_to_date, not_local, errors). Items in `updated` are
     {"image": str, "projects": list[str]} so the bot can show which projects
-    need a rebuild. `not_local` = base images missing locally (cannot be
-    compared; they get pulled on the next build).
+    need a rebuild. `not_local` = base images that could not be checked at all
+    (no local copy AND no build time to compare against).
     """
     client = _get_docker()
     if client is None:
         return ([], [], [], ["Docker not accessible"])
 
     updated, up_to_date, not_local, errors = [], [], [], []
+    build_times = _project_build_times()
 
     for image, projects in sorted(_base_image_projects().items()):
         tag = image if ":" in image else f"{image}:latest"
+        remote_created = _get_remote_created(tag)
+        remote_dt = _parse_timestamp(remote_created) if remote_created else None
 
         try:
             local = client.images.get(tag)
         except Exception:
-            # Not available locally — the next build will pull the latest version.
-            not_local.append(tag)
+            local = None
+
+        if local is None:
+            # No local base image (BuildKit keeps it in the build cache only).
+            # Estimate: upstream published after the project's image was built
+            # means a rebuild would pick up changes.
+            if not remote_dt:
+                not_local.append(tag)
+                continue
+            stale = [
+                p for p in projects
+                if (dt := _parse_timestamp(build_times.get(p, ""))) and remote_dt > dt
+            ]
+            unknown = [p for p in projects if p not in build_times]
+            if stale:
+                updated.append({"image": tag, "projects": stale, "approx": True})
+            elif len(unknown) == len(projects):
+                not_local.append(tag)
+            else:
+                up_to_date.append(tag)
             continue
 
-        remote_created = _get_remote_created(tag)
-        if not remote_created:
+        if not remote_dt:
             # Unknown registry / failed check — skip silently to keep the UI clean.
             continue
 
         local_dt = _parse_timestamp(local.attrs.get("Created", ""))
-        remote_dt = _parse_timestamp(remote_created)
-        if not local_dt or not remote_dt:
+        if not local_dt:
             continue
 
         if remote_dt > local_dt:
