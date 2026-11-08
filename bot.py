@@ -484,6 +484,13 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     print(f"❌ Error: {err}")
 
+    # Errors from the getUpdates/polling loop arrive with update=None (PTB
+    # routes them to the error handler). They are background noise, not a user
+    # command: sending them to Telegram spams the admin chat and usually fails
+    # anyway while the link is down.
+    if update is None:
+        return
+
     global _last_network_notice
 
     if isinstance(err, NetworkError):
@@ -531,7 +538,7 @@ def main():
     app.job_queue.run_repeating(background_update_check, interval=UPDATE_INTERVAL, first=10)
 
     print("🤖 MonitorBot running...")
-    app.run_polling()
+    app.run_polling(bootstrap_retries=3)
 
 
 if __name__ == "__main__":
